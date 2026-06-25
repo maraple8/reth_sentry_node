@@ -21,7 +21,7 @@ pub struct SentryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfigFile {
-    /// Chain ID (1 = mainnet).
+    /// Chain ID (137 = Polygon mainnet).
     #[serde(default = "default_chain_id")]
     pub chain_id: u64,
     /// Maximum number of peers.
@@ -36,6 +36,9 @@ pub struct NetworkConfigFile {
     /// Number of recent blocks to cache for peer requests.
     #[serde(default = "default_block_cache_size")]
     pub block_cache_size: usize,
+    /// Additional bootnodes (enode:// URIs) to connect to.
+    #[serde(default)]
+    pub bootnodes: Vec<String>,
 }
 
 fn default_block_cache_size() -> usize {
@@ -43,7 +46,7 @@ fn default_block_cache_size() -> usize {
 }
 
 fn default_chain_id() -> u64 {
-    1
+    137
 }
 fn default_max_peers() -> u32 {
     50
@@ -60,6 +63,7 @@ impl Default for NetworkConfigFile {
             p2p_port: default_port(),
             discovery_port: default_port(),
             block_cache_size: default_block_cache_size(),
+            bootnodes: vec![],
         }
     }
 }
@@ -82,6 +86,7 @@ impl From<&NetworkConfigFile> for SentryNetworkConfig {
             p2p_port: cfg.p2p_port,
             discovery_port: cfg.discovery_port,
             block_cache_size: cfg.block_cache_size,
+            bootnodes: cfg.bootnodes.clone(),
         }
     }
 }

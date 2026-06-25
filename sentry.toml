@@ -1,16 +1,22 @@
-# Reth Sentry Node Configuration
+# Reth Sentry Node Configuration - Polygon Mainnet
 
 [network]
-# Ethereum chain ID (1 = mainnet, 11155111 = sepolia)
-chain_id = 1
+# Polygon mainnet chain ID
+chain_id = 137
 # Maximum number of P2P peers
-max_peers = 50
+max_peers = 100
 # P2P TCP listen port
 p2p_port = 30303
 # Discovery UDP port
 discovery_port = 30303
 # Number of recent blocks to cache for peer requests (persisted to disk)
 block_cache_size = 256
+# Additional bootnodes (enode:// URIs).
+# Add known Polygon validator/sentry nodes here for better connectivity.
+# The more peers you connect to, the more pending transactions you'll receive.
+bootnodes = [
+    "enode://681b80dd0c0d04ee30bd0e40e8c127b89b3c985dd3de506b6c99bd9a46b2c5cdcea9dd13fbb1a8e92e5eaad18014c73d07bd20e39f3cd57e74e416bcb7ce5c4b@35.156.179.255:30303",
+]
 
 [backend]
 # Backend node RPC endpoints to forward validated transactions to

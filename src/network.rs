@@ -10,6 +10,7 @@ use crate::block_cache::BlockCache;
 use crate::block_import::CachingBlockImport;
 use crate::eth_proxy;
 use crate::forwarder::{ForwardableTx, TxForwarder};
+use crate::polygon;
 use alloy_eips::Encodable2718;
 use alloy_primitives::U256;
 use reth_chainspec::MAINNET;
@@ -17,7 +18,6 @@ use reth_eth_wire::EthNetworkPrimitives;
 use reth_ethereum_forks::Head;
 use reth_network::message::{NewBlockMessage, PeerMessage};
 use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager, NetworkHandle};
-use reth_tasks::Runtime;
 use reth_network_api::{
     events::PeerEvent, BlockDownloaderProvider, NetworkEvent, NetworkEventListenerProvider,
     Peers, PeersInfo,
@@ -38,7 +38,7 @@ use crate::validator::{StatelessValidator, StatelessValidatorConfig};
 /// Configuration for the sentry network.
 #[derive(Debug, Clone)]
 pub struct SentryNetworkConfig {
-    /// Chain ID (1 = mainnet).
+    /// Chain ID (137 = Polygon mainnet).
     pub chain_id: u64,
     /// Maximum number of peers.
     pub max_peers: u32,
@@ -48,16 +48,19 @@ pub struct SentryNetworkConfig {
     pub discovery_port: u16,
     /// Number of recent blocks to cache.
     pub block_cache_size: usize,
+    /// Additional bootnodes (enode:// URIs).
+    pub bootnodes: Vec<String>,
 }
 
 impl Default for SentryNetworkConfig {
     fn default() -> Self {
         Self {
-            chain_id: 1,
+            chain_id: 137,
             max_peers: 50,
             p2p_port: 30303,
             discovery_port: 30303,
             block_cache_size: 256,
+            bootnodes: vec![],
         }
     }
 }
@@ -114,6 +117,9 @@ pub async fn start_sentry_network(
         .with_max_outbound(net_config.max_peers as usize / 2)
         .with_max_inbound_opt(Some(net_config.max_peers as usize / 2));
 
+    // Determine chain spec and head block based on chain_id
+    let is_polygon = net_config.chain_id == polygon::POLYGON_CHAIN_ID;
+
     // Determine head block for status message and fork ID.
     // Use latest cached block if available, otherwise estimate from current time.
     let head = if let Some((hash, header)) = block_cache.latest() {
@@ -126,27 +132,42 @@ pub async fn start_sentry_network(
             number: header.number,
             hash,
             difficulty: U256::ZERO,
-            total_difficulty: U256::from(58_750_000_000_000_000_000_000_u128),
+            total_difficulty: U256::ZERO,
             timestamp: header.timestamp,
         }
     } else {
-        // Estimate current block from time (post-merge, 12s blocks)
-        // Using a recent known block as anchor
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let estimated_number = (now - 1_681_338_455) / 12 + 17_034_870;
-        info!(
-            estimated_number,
-            "no cached blocks, using estimated head for fork ID"
-        );
-        Head {
-            number: estimated_number,
-            hash: MAINNET.genesis_hash(),
-            difficulty: U256::ZERO,
-            total_difficulty: U256::from(58_750_000_000_000_000_000_000_u128),
-            timestamp: now,
+
+        if is_polygon {
+            let estimated_number = polygon::estimate_current_block();
+            info!(
+                estimated_number,
+                "no cached blocks, using estimated Polygon head"
+            );
+            Head {
+                number: estimated_number,
+                hash: polygon::POLYGON_GENESIS_HASH,
+                difficulty: U256::ZERO,
+                total_difficulty: U256::ZERO,
+                timestamp: now,
+            }
+        } else {
+            // Ethereum mainnet estimation
+            let estimated_number = (now - 1_681_338_455) / 12 + 17_034_870;
+            info!(
+                estimated_number,
+                "no cached blocks, using estimated head for fork ID"
+            );
+            Head {
+                number: estimated_number,
+                hash: MAINNET.genesis_hash(),
+                difficulty: U256::ZERO,
+                total_difficulty: U256::from(58_750_000_000_000_000_000_000_u128),
+                timestamp: now,
+            }
         }
     };
 
@@ -155,16 +176,38 @@ pub async fn start_sentry_network(
         .with_tokio(reth_tasks::runtime::TokioConfig::existing_handle(tokio::runtime::Handle::current())))
         .build()?;
 
-    let net_builder = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key, runtime)
+    let mut net_builder = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key, runtime)
         .listener_port(net_config.p2p_port)
         .discovery_port(net_config.discovery_port)
         .peer_config(peers_config)
         .set_head(head)
         .block_import(Box::new(block_import))
-        .disable_dns_discovery()
-        .mainnet_boot_nodes();
+        .disable_dns_discovery();
 
-    let network_config = net_builder.build_with_noop_provider(MAINNET.clone());
+    // Parse custom bootnodes from config
+    let custom_bootnodes: Vec<reth_network_peers::NodeRecord> = net_config
+        .bootnodes
+        .iter()
+        .filter_map(|e| e.parse().ok())
+        .collect();
+
+    let chain_spec = if is_polygon {
+        let polygon_spec = polygon::polygon_chain_spec();
+        let mut bootnodes = polygon::polygon_bootnodes();
+        bootnodes.extend(custom_bootnodes);
+        info!(bootnodes = bootnodes.len(), "using Polygon bootnodes");
+        net_builder = net_builder.boot_nodes(bootnodes);
+        polygon_spec
+    } else {
+        if !custom_bootnodes.is_empty() {
+            net_builder = net_builder.boot_nodes(custom_bootnodes);
+        } else {
+            net_builder = net_builder.mainnet_boot_nodes();
+        }
+        MAINNET.clone()
+    };
+
+    let network_config = net_builder.build_with_noop_provider(chain_spec);
 
     // Build the network
     let mut network = NetworkManager::new(network_config).await?;
@@ -324,7 +367,7 @@ async fn rebroadcast_new_blocks(
                     number: block_number,
                     hash: new_block.hash,
                     difficulty: U256::ZERO,
-                    total_difficulty: U256::from(58_750_000_000_000_000_000_000_u128),
+                    total_difficulty: U256::ZERO,
                     timestamp: header.timestamp,
                 });
 

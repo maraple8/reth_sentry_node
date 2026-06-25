@@ -4573,6 +4573,7 @@ dependencies = [
  "reth-network-api",
  "reth-network-p2p",
  "reth-network-peers",
+ "reth-primitives-traits",
  "reth-tasks",
  "reth-transaction-pool",
  "secp256k1 0.30.0",

@@ -15,6 +15,7 @@ mod eth_proxy;
 mod forwarder;
 mod network;
 mod node_key;
+mod polygon;
 mod validator;
 mod ws_server;
 
@@ -44,8 +45,8 @@ struct Cli {
     #[arg(long, default_value_t = 50)]
     max_peers: u32,
 
-    /// Chain ID (1 = mainnet).
-    #[arg(long, default_value_t = 1)]
+    /// Chain ID (137 = Polygon mainnet).
+    #[arg(long, default_value_t = 137)]
     chain_id: u64,
 
     /// Backend RPC endpoints to forward transactions to (comma-separated).
@@ -93,6 +94,7 @@ async fn main() -> eyre::Result<()> {
                 p2p_port: cli.port,
                 discovery_port: cli.port,
                 block_cache_size: cli.block_cache_size,
+                bootnodes: vec![],
             },
             backend: if cli.backends.is_empty() {
                 BackendConfig {

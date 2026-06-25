@@ -37,7 +37,7 @@ pub struct StatelessValidatorConfig {
 impl Default for StatelessValidatorConfig {
     fn default() -> Self {
         Self {
-            chain_id: 1,
+            chain_id: 137,
             max_tx_gas_limit: MAX_TX_GAS_LIMIT,
         }
     }
