@@ -96,13 +96,25 @@ pub fn polygon_bootnodes() -> Vec<NodeRecord> {
 
     let nodes: Vec<NodeRecord> = enodes
         .iter()
-        .filter_map(|e| e.parse().ok())
+        .enumerate()
+        .filter_map(|(i, e)| {
+            match e.parse::<NodeRecord>() {
+                Ok(node) => {
+                    tracing::debug!(index = i, addr = %node.address, "builtin bootnode parsed OK");
+                    Some(node)
+                }
+                Err(_) => {
+                    tracing::warn!(index = i, enode = %e, "builtin bootnode parse FAILED (bad key length?)");
+                    None
+                }
+            }
+        })
         .collect();
 
-    // If no bootnodes parsed, log a warning. The node will still work
-    // if peers connect to us, or if we add peers manually via admin_addPeer.
     if nodes.is_empty() {
-        tracing::warn!("no valid bootnodes parsed, peer discovery may be slow");
+        tracing::warn!("no valid builtin bootnodes — rely on config bootnodes or manual peer addition");
+    } else {
+        tracing::info!(count = nodes.len(), "builtin bootnodes ready");
     }
 
     nodes

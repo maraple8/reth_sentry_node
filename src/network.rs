@@ -31,7 +31,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::validator::{StatelessValidator, StatelessValidatorConfig};
 
@@ -188,14 +188,37 @@ pub async fn start_sentry_network(
     let custom_bootnodes: Vec<reth_network_peers::NodeRecord> = net_config
         .bootnodes
         .iter()
-        .filter_map(|e| e.parse().ok())
+        .filter_map(|e| {
+            match e.parse::<reth_network_peers::NodeRecord>() {
+                Ok(node) => {
+                    info!(enode = %e, "parsed bootnode OK");
+                    Some(node)
+                }
+                Err(err) => {
+                    warn!(enode = %e, error = %err, "failed to parse bootnode, skipping");
+                    None
+                }
+            }
+        })
         .collect();
 
     let chain_spec = if is_polygon {
         let polygon_spec = polygon::polygon_chain_spec();
+        let genesis_hash = polygon_spec.genesis_hash();
+        let fork_id = polygon_spec.fork_id(&head);
+        info!(
+            %genesis_hash,
+            fork_hash = ?fork_id.hash,
+            fork_next = fork_id.next,
+            head_number = head.number,
+            head_timestamp = head.timestamp,
+            "polygon chain spec: fork_id for peer handshake"
+        );
+
         let mut bootnodes = polygon::polygon_bootnodes();
+        info!(builtin_bootnodes = bootnodes.len(), custom_bootnodes = custom_bootnodes.len(), "bootnode counts");
         bootnodes.extend(custom_bootnodes);
-        info!(bootnodes = bootnodes.len(), "using Polygon bootnodes");
+        info!(total_bootnodes = bootnodes.len(), "using Polygon bootnodes");
         net_builder = net_builder.boot_nodes(bootnodes);
         polygon_spec
     } else {
@@ -225,6 +248,10 @@ pub async fn start_sentry_network(
 
     info!(
         peer_id = %network_handle.peer_id(),
+        chain_id = net_config.chain_id,
+        p2p_port = net_config.p2p_port,
+        max_peers = net_config.max_peers,
+        is_polygon,
         "sentry node started, listening for peers"
     );
 
@@ -256,6 +283,7 @@ pub async fn start_sentry_network(
 
     // Spawn a task to monitor peer connections
     let handle_clone = network_handle.clone();
+    let pool_monitor = tx_pool.clone();
     let shutdown_monitor = shutdown.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -263,7 +291,16 @@ pub async fn start_sentry_network(
             tokio::select! {
                 _ = interval.tick() => {
                     let num_peers = handle_clone.num_connected_peers();
-                    info!(num_peers, "peer count update");
+                    let pool_size = pool_monitor.pool_size();
+                    info!(
+                        num_peers,
+                        pool_pending = pool_size.pending,
+                        pool_queued = pool_size.queued,
+                        "status"
+                    );
+                    if num_peers == 0 {
+                        warn!("no peers connected — check: 1) firewall allows 30303 TCP+UDP 2) fork_id matches Polygon nodes 3) bootnodes are reachable");
+                    }
                 }
                 _ = shutdown_monitor.cancelled() => break,
             }
@@ -275,12 +312,28 @@ pub async fn start_sentry_network(
     let shutdown_tx = shutdown.clone();
     tokio::spawn(async move {
         let mut pending_txs = pool_clone.pending_transactions_listener();
+        let mut tx_count: u64 = 0;
+        let start_time = std::time::Instant::now();
         info!("listening for new pending transactions to forward");
 
         loop {
             tokio::select! {
                 Some(tx_hash) = pending_txs.recv() => {
-                    debug!(%tx_hash, "new pending transaction detected");
+                    tx_count += 1;
+                    let elapsed = start_time.elapsed().as_secs();
+                    let tps = if elapsed > 0 { tx_count / elapsed } else { 0 };
+
+                    if tx_count <= 10 || tx_count % 100 == 0 {
+                        info!(
+                            %tx_hash,
+                            tx_count,
+                            tps,
+                            elapsed_secs = elapsed,
+                            "pending tx received"
+                        );
+                    } else {
+                        debug!(%tx_hash, tx_count, "pending tx received");
+                    }
 
                     if let Some(tx) = pool_clone.get(&tx_hash) {
                         let consensus_tx = tx.transaction.clone_into_consensus();
@@ -292,41 +345,55 @@ pub async fn start_sentry_network(
                                 raw_tx,
                             })
                             .await;
+                    } else {
+                        warn!(%tx_hash, "tx announced but not found in pool");
                     }
                 }
                 _ = shutdown_tx.cancelled() => break,
             }
         }
+        info!(tx_count, "pending tx listener stopped");
     });
 
     // Main event loop - handle network events until shutdown
+    let mut total_peers_connected: u64 = 0;
+    let mut total_peers_disconnected: u64 = 0;
     loop {
         tokio::select! {
             Some(event) = events.next() => {
                 match event {
                     NetworkEvent::ActivePeerSession { info, .. } => {
+                        total_peers_connected += 1;
                         info!(
                             peer_id = %info.peer_id,
                             remote_addr = %info.remote_addr,
                             client_version = %info.client_version,
+                            total_connected = total_peers_connected,
                             "new peer connected"
                         );
                     }
                     NetworkEvent::Peer(peer_event) => match peer_event {
                         PeerEvent::SessionClosed { peer_id, reason } => {
-                            debug!(
+                            total_peers_disconnected += 1;
+                            warn!(
                                 %peer_id,
                                 ?reason,
+                                total_disconnected = total_peers_disconnected,
                                 "peer disconnected"
                             );
                         }
                         PeerEvent::PeerAdded(peer_id) => {
-                            debug!(%peer_id, "peer added to pool");
+                            debug!(%peer_id, "peer added to discovery pool");
                         }
                         PeerEvent::PeerRemoved(peer_id) => {
-                            debug!(%peer_id, "peer removed from pool");
+                            debug!(%peer_id, "peer removed from discovery pool");
                         }
-                        PeerEvent::SessionEstablished(_) => {}
+                        PeerEvent::SessionEstablished(info) => {
+                            info!(
+                                peer_id = %info.peer_id,
+                                "session established (pre-handshake)"
+                            );
+                        }
                     },
                 }
             }
@@ -355,12 +422,28 @@ async fn rebroadcast_new_blocks(
     shutdown: CancellationToken,
 ) {
     info!("NewBlock rebroadcast task started");
+    let mut block_count: u64 = 0;
 
     loop {
         tokio::select! {
             Some(new_block) = rx.recv() => {
+                block_count += 1;
                 let header = &new_block.block.block.header;
                 let block_number = header.number;
+                let block_timestamp = header.timestamp;
+                let tx_count = new_block.block.block.body.transactions.len();
+
+                // Log first few blocks and then every 100th
+                if block_count <= 5 || block_count % 100 == 0 {
+                    info!(
+                        block_number,
+                        block_count,
+                        tx_count,
+                        block_timestamp,
+                        hash = %new_block.hash,
+                        "received NewBlock from peer"
+                    );
+                }
 
                 // Update network status so our fork ID stays current
                 handle.update_status(Head {
@@ -368,7 +451,7 @@ async fn rebroadcast_new_blocks(
                     hash: new_block.hash,
                     difficulty: U256::ZERO,
                     total_difficulty: U256::ZERO,
-                    timestamp: header.timestamp,
+                    timestamp: block_timestamp,
                 });
 
                 // Get all connected peers and send the NewBlock to each
@@ -400,5 +483,5 @@ async fn rebroadcast_new_blocks(
         }
     }
 
-    info!("NewBlock rebroadcast task stopped");
+    info!(block_count, "NewBlock rebroadcast task stopped");
 }
